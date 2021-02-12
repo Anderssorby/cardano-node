@@ -42,6 +42,9 @@ module Cardano.Api.TxBody (
     TxOut(..),
     TxOutValue(..),
 
+    -- ** Plutus script purpose
+    PlutusScriptPurpose(..),
+
     -- * Other transaction body types
     TxFee(..),
     TxValidityLowerBound(..),
@@ -68,6 +71,7 @@ module Cardano.Api.TxBody (
     UpdateProposalSupportedInEra(..),
     TxExecutionUnits(..),
     TxWitnessPPData(..),
+    WitnessPPDataSupportedInEra(..),
 
     -- ** Feature availability functions
     multiAssetSupportedInEra,
@@ -81,6 +85,7 @@ module Cardano.Api.TxBody (
     certificatesSupportedInEra,
     updateProposalSupportedInEra,
     executionUnitsSupportedInEra,
+    witnessPPDataSupportedInEra,
 
     -- * Internal conversion functions & types
     toShelleyTxId,
@@ -106,7 +111,7 @@ import           Data.Aeson.Types (ToJSONKey (..), toJSONKeyText)
 import           Data.Bifunctor (first)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as LBS
-import           Data.List (intercalate)
+import           Data.List (elemIndex, findIndex, intercalate)
 import qualified Data.List.NonEmpty as NonEmpty
 import           Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -284,6 +289,78 @@ data TxInTypeInEra era where
 deriving instance Eq (TxInTypeInEra era)
 deriving instance Ord (TxInTypeInEra era)
 deriving instance Show (TxInTypeInEra era)
+
+-- ----------------------------------------------------------------------------
+-- Plutus script purpose. Plutus scripts in the Alonzo era can do the following:
+--   1. Validate spending a script UTxO entry.
+--   2. Validate minting tokens.
+--   3. Validate certificates with script credentials.
+--   4. Validate reward withdrawals from script addresses.
+
+data PlutusScriptPurpose era where
+  Spending   :: TxIn era     -> PlutusScriptPurpose era
+  Minting    :: PolicyId     -> PlutusScriptPurpose era
+  Certifying :: Certificate  -> PlutusScriptPurpose era
+  Rewarding  :: StakeAddress -> PlutusScriptPurpose era
+
+-- | Points to the relevant index
+data RedeemerPointer =
+    CertificateRedeemer Word64
+  | MintingRedeemer Word64
+  | SpendingRedeemer Word64
+  | RewardingRedeemer Word64
+
+generateRewardingRedeemer
+  :: CardanoEra era
+  -> PlutusScriptPurpose era
+  -> TxWithdrawals era
+  -> Maybe RedeemerPointer
+generateRewardingRedeemer era (Rewarding stkAddr) txWithdrawals =
+  case scriptLanguageSupportedInEra era (PlutusScriptLanguage PlutusScriptV1) of
+    Nothing -> Nothing
+    Just _ -> let TxWithdrawals _ addrs = txWithdrawals
+              in RewardingRedeemer . fromIntegral
+                   <$> findIndex
+                         (\(stakeAddr,_) -> stakeAddr == stkAddr)
+                         addrs
+generateRewardingRedeemer _ _ _ = Nothing
+
+generateSpendingRedeemer
+  :: CardanoEra era
+  -> PlutusScriptPurpose era
+  -> [TxIn era]
+  -> Maybe RedeemerPointer
+generateSpendingRedeemer era (Spending txin) txins =
+  case scriptLanguageSupportedInEra era (PlutusScriptLanguage PlutusScriptV1) of
+    Nothing -> Nothing
+    Just _ -> SpendingRedeemer . fromIntegral <$> elemIndex txin txins
+generateSpendingRedeemer _ _ _ = Nothing
+
+generateCertificateRedeemer
+  :: CardanoEra era
+  -> PlutusScriptPurpose era
+  -> TxCertificates era
+  -> Maybe RedeemerPointer
+generateCertificateRedeemer era (Certifying cert) txCerts =
+  case scriptLanguageSupportedInEra era (PlutusScriptLanguage PlutusScriptV1) of
+    Nothing -> Nothing
+    Just _ -> let TxCertificates _ certs = txCerts
+              in CertificateRedeemer . fromIntegral <$> elemIndex cert certs
+generateCertificateRedeemer _ _ _ = Nothing
+
+generateMintingRedeemer
+ :: CardanoEra era
+ -> PlutusScriptPurpose era
+ -> Value
+ -> Maybe RedeemerPointer
+generateMintingRedeemer era (Minting _polId) val =
+  case scriptLanguageSupportedInEra era (PlutusScriptLanguage PlutusScriptV1) of
+    Nothing -> Nothing
+    Just _ -> MintingRedeemer . fromIntegral
+                 <$> findIndex
+                       (error "TODO") --(\(AssetId pId _,_) -> polId == pId)
+                       (valueToList val)
+generateMintingRedeemer _ _ _ = Nothing
 
 
 instance ToJSON (TxIn era) where
@@ -874,7 +951,7 @@ deriving instance Show (TxMintValue era)
 --
 
 data TxExecutionUnits era where
-    TxNoExecutionUnits :: TxExecutionUnits era
+    TxExecutionUnitsNone :: TxExecutionUnits era
     TxExecutionUnits   :: ExecutionUnitsSupportedInEra era -> Word64 -> Word64 -> TxExecutionUnits era
 
 data ExecutionUnitsSupportedInEra era where
@@ -892,9 +969,21 @@ executionUnitsSupportedInEra AlonzoEra  = Just ExecutionUnitsSupportedInAlonzoEr
 -- Data necessary to create a hash of the script execution data.
 --
 data TxWitnessPPData era where
+    TxWitnessPPDataNone :: TxWitnessPPData era
     TxWitnessPPData :: ProtocolParameters --TODO: This will need an era parameter to account for Alonzo
-                    -> [(PlutusScriptPurpose era, Word64, ScriptDatum)]
+                    -> [(PlutusScriptPurpose era, Maybe ScriptDatum)]
                     -> TxWitnessPPData era
+
+data WitnessPPDataSupportedInEra era where
+
+    WitnessPPDataSupportedInAlonzoEra  :: WitnessPPDataSupportedInEra AlonzoEra
+
+witnessPPDataSupportedInEra :: CardanoEra era -> Maybe (WitnessPPDataSupportedInEra era)
+witnessPPDataSupportedInEra ByronEra   = Nothing
+witnessPPDataSupportedInEra ShelleyEra = Nothing
+witnessPPDataSupportedInEra AllegraEra = Nothing
+witnessPPDataSupportedInEra MaryEra    = Nothing
+witnessPPDataSupportedInEra AlonzoEra  = Just WitnessPPDataSupportedInAlonzoEra
 
 -- ----------------------------------------------------------------------------
 -- Transaction body content
@@ -1430,8 +1519,8 @@ makeByronTransaction txIns txOuts =
         txCertificates   = TxCertificatesNone,
         txUpdateProposal = TxUpdateProposalNone,
         txMintValue      = TxMintNone,
-        txExecutionUnits = TxNoExecutionUnits,
-        txWitnessPPData  = error "TODO: TxWitnessPPData era"
+        txExecutionUnits = TxExecutionUnitsNone,
+        txWitnessPPData  = TxWitnessPPDataNone
       }
 
 -- | Transitional function to help the CLI move to the updated TxBody API.
@@ -1467,8 +1556,8 @@ makeShelleyTransaction txIns txOuts ttl fee
                              Just up -> TxUpdateProposal
                                           UpdateProposalInShelleyEra up,
         txMintValue      = TxMintNone,
-        txExecutionUnits  = TxNoExecutionUnits,
-        txWitnessPPData = error "TODO "
+        txExecutionUnits = TxExecutionUnitsNone,
+        txWitnessPPData  = TxWitnessPPDataNone
       }
 
 
